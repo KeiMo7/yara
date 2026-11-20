@@ -355,6 +355,9 @@ test_iterators_LDFLAGS = -static
 test_exec_SOURCES = tests/test-exec.c tests/util.c
 test_exec_LDADD = libyara.la
 test_exec_LDFLAGS = -static
+test_include_diagnostics_SOURCES = tests/test-include-diagnostics.c
+test_include_diagnostics_LDADD = libyara.la
+test_include_diagnostics_LDFLAGS = -static
 
 TESTS = $(check_PROGRAMS)
 TESTS_ENVIRONMENT = TOP_SRCDIR=$(top_srcdir) TOP_BUILDDIR=$(top_builddir)
@@ -375,7 +378,8 @@ check_PROGRAMS = \
   test-async \
   test-iterators \
   test-exec \
-  test-string
+  test-string \
+  test-include-diagnostics
 
 EXTRA_PROGRAMS = tests/mapper
 CLEANFILES = tests/mapper$(EXEEXT)

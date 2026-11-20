@@ -30,11 +30,17 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <assert.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+
+#if defined(_WIN32)
+#include <ctype.h>
+#endif
 
 #ifdef _MSC_VER
 #include <io.h>
@@ -52,6 +58,27 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <yara/object.h>
 #include <yara/strutils.h>
 #include <yara/utils.h>
+
+static void _yr_compiler_free_diagnostic(YR_DIAGNOSTIC* diag);
+
+static void _yr_compiler_free_included_file(YR_INCLUDED_FILE* included)
+{
+  if (included != NULL)
+  {
+    yr_free(included->file_name);
+    yr_free(included->included_from);
+    yr_free(included);
+  }
+}
+
+static void _yr_compiler_free_rule_location(YR_RULE_LOCATION* location)
+{
+  if (location != NULL)
+  {
+    yr_free(location->file_name);
+    yr_free(location);
+  }
+}
 
 static void _yr_compiler_default_include_free(
     const char* callback_result_ptr,
@@ -264,6 +291,9 @@ YR_API int yr_compiler_create(YR_COMPILER** compiler)
   new_compiler->fixup_stack_head = NULL;
   new_compiler->loop_index = -1;
   new_compiler->loop_for_of_var_index = -1;
+  new_compiler->diagnostics_enabled = false;
+  new_compiler->diagnostics = NULL;
+  new_compiler->num_diagnostics = 0;
 
   new_compiler->atoms_config.get_atom_quality = yr_atoms_heuristic_quality;
   new_compiler->atoms_config.quality_warning_threshold =
@@ -283,6 +313,12 @@ YR_API int yr_compiler_create(YR_COMPILER** compiler)
 
   if (result == ERROR_SUCCESS)
     result = yr_hash_table_create(10000, &new_compiler->sz_table);
+
+  if (result == ERROR_SUCCESS)
+    result = yr_hash_table_create(1000, &new_compiler->included_files);
+
+  if (result == ERROR_SUCCESS)
+    result = yr_hash_table_create(5000, &new_compiler->rule_locations);
 
   if (result == ERROR_SUCCESS)
     result = yr_arena_create(YR_NUM_SECTIONS, 1048576, &new_compiler->arena);
@@ -323,6 +359,16 @@ YR_API void yr_compiler_destroy(YR_COMPILER* compiler)
   if (compiler->sz_table != NULL)
     yr_hash_table_destroy(compiler->sz_table, NULL);
 
+  if (compiler->included_files != NULL)
+    yr_hash_table_destroy(
+        compiler->included_files,
+        (YR_HASH_TABLE_FREE_VALUE_FUNC) _yr_compiler_free_included_file);
+
+  if (compiler->rule_locations != NULL)
+    yr_hash_table_destroy(
+        compiler->rule_locations,
+        (YR_HASH_TABLE_FREE_VALUE_FUNC) _yr_compiler_free_rule_location);
+
   if (compiler->objects_table != NULL)
     yr_hash_table_destroy(
         compiler->objects_table,
@@ -332,7 +378,15 @@ YR_API void yr_compiler_destroy(YR_COMPILER* compiler)
     yr_free(compiler->atoms_config.quality_table);
 
   for (int i = 0; i < compiler->file_name_stack_ptr; i++)
-    yr_free(compiler->file_name_stack[i]);
+  {
+    yr_free(compiler->file_name_stack[i].file_name);
+    yr_free(compiler->file_name_stack[i].canonical_id);
+  }
+
+  for (int i = 0; i < compiler->num_diagnostics; i++)
+    _yr_compiler_free_diagnostic(&compiler->diagnostics[i]);
+
+  yr_free(compiler->diagnostics);
 
   YR_FIXUP* fixup = compiler->fixup_stack_head;
 
@@ -471,26 +525,442 @@ YR_API int yr_compiler_load_atom_quality_table(
   return ERROR_SUCCESS;
 }
 
-int _yr_compiler_push_file_name(YR_COMPILER* compiler, const char* file_name)
+////////////////////////////////////////////////////////////////////////////////
+// Lexically normalizes a path: collapses repeated separators, removes "."
+// components and resolves ".." components without touching the file system.
+// The result is absolute only if the input was absolute. Returns a newly
+// allocated string or NULL on memory allocation failure.
+//
+static char* _yr_compiler_normalize_path_lexically(const char* path)
+{
+  size_t len = strlen(path);
+  char* result = (char*) yr_malloc(len + 2);
+
+  if (result == NULL)
+    return NULL;
+
+  // Components are recorded as (offset, length) pairs into result.
+  size_t* offsets = (size_t*) yr_malloc((len + 1) * 2 * sizeof(size_t));
+
+  if (offsets == NULL)
+  {
+    yr_free(result);
+    return NULL;
+  }
+
+  int absolute = (path[0] == '/');
+  size_t num_components = 0;
+  size_t out_len = 0;
+  size_t i = absolute ? 1 : 0;
+
+  while (i <= len)
+  {
+    // Skip separators.
+    while (path[i] == '/')
+      i++;
+
+    size_t start = i;
+
+    while (path[i] != '/' && path[i] != '\0')
+      i++;
+
+    size_t comp_len = i - start;
+
+    if (comp_len == 0)
+      break;
+
+    if (comp_len == 1 && path[start] == '.')
+      continue;
+
+    if (comp_len == 2 && path[start] == '.' && path[start + 1] == '.')
+    {
+      if (num_components > 0 &&
+          !(offsets[2 * (num_components - 1) + 1] == 2 &&
+            result[offsets[2 * (num_components - 1)]] == '.' &&
+            result[offsets[2 * (num_components - 1)] + 1] == '.'))
+      {
+        // Pop the last component, unless it is "..".
+        num_components--;
+        out_len = num_components > 0
+                      ? offsets[2 * (num_components - 1)] +
+                            offsets[2 * (num_components - 1) + 1]
+                      : 0;
+      }
+      else if (!absolute)
+      {
+        // Leading ".." in a relative path must be preserved.
+        offsets[2 * num_components] = out_len;
+        offsets[2 * num_components + 1] = 2;
+        memcpy(result + out_len, "..", 2);
+        out_len += 2;
+        num_components++;
+      }
+      continue;
+    }
+
+    offsets[2 * num_components] = out_len;
+    offsets[2 * num_components + 1] = comp_len;
+    memcpy(result + out_len, path + start, comp_len);
+    out_len += comp_len;
+    num_components++;
+  }
+
+  // Rebuild the path with single separators.
+  char* normalized = (char*) yr_malloc(len + 2);
+
+  if (normalized == NULL)
+  {
+    yr_free(offsets);
+    yr_free(result);
+    return NULL;
+  }
+
+  size_t pos = 0;
+
+  if (absolute)
+    normalized[pos++] = '/';
+
+  for (size_t c = 0; c < num_components; c++)
+  {
+    if (c > 0)
+      normalized[pos++] = '/';
+
+    memcpy(
+        normalized + pos,
+        result + offsets[2 * c],
+        offsets[2 * c + 1]);
+
+    pos += offsets[2 * c + 1];
+  }
+
+  if (pos == 0)
+    normalized[pos++] = '.';
+
+  normalized[pos] = '\0';
+
+  yr_free(offsets);
+  yr_free(result);
+
+  return normalized;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Computes the canonical identity for a file path. Two different spellings of
+// the same file (relative prefixes, redundant separators, "." and ".."
+// components, symbolic links, and case variations on case-insensitive file
+// systems) map to the same identity. Returns a newly allocated string, or
+// NULL if the identity can not be determined. Callers must treat a NULL
+// result as "identity uncertain" and must not guess a disk path for sources
+// that are not disk files.
+//
+static char* _yr_compiler_canonicalize_path(const char* path)
+{
+  if (path == NULL)
+    return NULL;
+
+#if defined(_WIN32)
+  // _fullpath() resolves to an absolute path but does not resolve symbolic
+  // links. Windows file systems are case-insensitive and accept both
+  // separators, so both are normalized.
+  char* full = _fullpath(NULL, path, 0);
+
+  if (full == NULL)
+    return NULL;
+
+  for (char* p = full; *p != '\0'; p++)
+  {
+    if (*p == '/')
+      *p = '\\';
+    else
+      *p = (char) tolower((unsigned char) *p);
+  }
+
+  char* result = yr_strdup(full);
+  free(full);
+  return result;
+#else
+  // realpath() resolves symbolic links, ".", ".." and redundant separators,
+  // but requires the file to exist.
+  char* resolved = realpath(path, NULL);
+
+  if (resolved != NULL)
+  {
+    char* result = yr_strdup(resolved);
+    free(resolved);
+    return result;
+  }
+
+  // The file doesn't exist (yet) or can't be resolved; fall back to a purely
+  // lexical normalization of the path as written.
+  return _yr_compiler_normalize_path_lexically(path);
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Returns the name of the namespace the compiler is currently populating.
+//
+static const char* _yr_compiler_current_namespace_name(YR_COMPILER* compiler)
+{
+  YR_NAMESPACE* ns = (YR_NAMESPACE*) yr_arena_get_ptr(
+      compiler->arena,
+      YR_NAMESPACES_TABLE,
+      compiler->current_namespace_idx * sizeof(struct YR_NAMESPACE));
+
+  return ns != NULL ? ns->name : NULL;
+}
+
+static void _yr_compiler_free_diagnostic(YR_DIAGNOSTIC* diag)
+{
+  if (diag->chain != NULL)
+  {
+    for (int i = 0; i < diag->chain_length; i++)
+    {
+      yr_free(diag->chain[i].file_name);
+      yr_free(diag->chain[i].canonical_id);
+    }
+
+    yr_free(diag->chain);
+  }
+
+  yr_free(diag->message);
+  yr_free(diag->identifier);
+  yr_free(diag->related_file);
+  yr_free(diag->name_space);
+}
+
+// Two diagnostics are considered equal if they have the same kind, the same
+// message and the same include chain. The parser's error recovery may reduce
+// the same action multiple times for a single offending construct (while
+// reporting the error itself only once), which makes diagnostic-producing
+// code paths run repeatedly with identical inputs; deduplicating here keeps
+// such paths from flooding the diagnostic list with copies of the same
+// diagnostic.
+static bool _yr_compiler_diagnostic_equals(
+    YR_DIAGNOSTIC* a,
+    YR_DIAGNOSTIC* b)
+{
+  if (a->kind != b->kind || a->chain_length != b->chain_length)
+    return false;
+
+  if (a->message == NULL || b->message == NULL ||
+      strcmp(a->message, b->message) != 0)
+  {
+    return false;
+  }
+
+  for (int i = 0; i < a->chain_length; i++)
+  {
+    if (a->chain[i].line != b->chain[i].line)
+      return false;
+
+    if (a->chain[i].file_name == NULL || b->chain[i].file_name == NULL ||
+        strcmp(a->chain[i].file_name, b->chain[i].file_name) != 0)
+    {
+      return false;
+    }
+
+    if ((a->chain[i].canonical_id == NULL) !=
+        (b->chain[i].canonical_id == NULL))
+    {
+      return false;
+    }
+
+    if (a->chain[i].canonical_id != NULL &&
+        strcmp(a->chain[i].canonical_id, b->chain[i].canonical_id) != 0)
+    {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+YR_DIAGNOSTIC* _yr_compiler_add_diagnostic(
+    YR_COMPILER* compiler,
+    int kind,
+    const char* extra_hop_file,
+    int extra_hop_line,
+    const char* message_fmt,
+    ...)
+{
+  if (!compiler->diagnostics_enabled)
+    return NULL;
+
+  int chain_length =
+      compiler->file_name_stack_ptr + (extra_hop_file != NULL ? 1 : 0);
+
+  YR_DIAGNOSTIC diag;
+  memset(&diag, 0, sizeof(diag));
+
+  diag.kind = kind;
+  diag.chain_length = chain_length;
+  diag.chain = (YR_INCLUDE_CHAIN_ENTRY*) yr_calloc(
+      chain_length > 0 ? chain_length : 1, sizeof(YR_INCLUDE_CHAIN_ENTRY));
+
+  if (diag.chain == NULL)
+    return NULL;
+
+  // Snapshot the current include chain so that the diagnostic remains
+  // meaningful after the compiler's include stack is unwound.
+  for (int i = 0; i < compiler->file_name_stack_ptr; i++)
+  {
+    diag.chain[i].file_name = yr_strdup(compiler->file_name_stack[i].file_name);
+    diag.chain[i].canonical_id =
+        compiler->file_name_stack[i].canonical_id != NULL
+            ? yr_strdup(compiler->file_name_stack[i].canonical_id)
+            : NULL;
+    diag.chain[i].line = compiler->file_name_stack[i].line;
+  }
+
+  if (extra_hop_file != NULL)
+  {
+    diag.chain[chain_length - 1].file_name = yr_strdup(extra_hop_file);
+    diag.chain[chain_length - 1].canonical_id = NULL;
+    diag.chain[chain_length - 1].line = extra_hop_line;
+  }
+
+  char message[1024];
+  va_list args;
+  va_start(args, message_fmt);
+  vsnprintf(message, sizeof(message), message_fmt, args);
+  va_end(args);
+
+  diag.message = yr_strdup(message);
+
+  // If the previous diagnostic is identical to this one, drop the new one.
+  if (compiler->num_diagnostics > 0 &&
+      _yr_compiler_diagnostic_equals(
+          &compiler->diagnostics[compiler->num_diagnostics - 1], &diag))
+  {
+    _yr_compiler_free_diagnostic(&diag);
+    return NULL;
+  }
+
+  YR_DIAGNOSTIC* new_diagnostics = (YR_DIAGNOSTIC*) yr_realloc(
+      compiler->diagnostics,
+      (compiler->num_diagnostics + 1) * sizeof(YR_DIAGNOSTIC));
+
+  if (new_diagnostics == NULL)
+  {
+    _yr_compiler_free_diagnostic(&diag);
+    return NULL;
+  }
+
+  compiler->diagnostics = new_diagnostics;
+  compiler->diagnostics[compiler->num_diagnostics] = diag;
+  compiler->num_diagnostics++;
+
+  return &compiler->diagnostics[compiler->num_diagnostics - 1];
+}
+
+int _yr_compiler_push_file_name(
+    YR_COMPILER* compiler,
+    const char* file_name,
+    int line)
 {
   char* str;
+  char* canonical_id = NULL;
   int i;
+
+  // The canonical identity is only computed for sources that are known to be
+  // local files. For anything else (in-memory rules, custom include
+  // callbacks fetching rules from the network, etc.) the identity is
+  // uncertain and canonical_id remains NULL; in that case cycle detection
+  // falls back to comparing the names as written, exactly as it did before
+  // this facility existed.
+  if (compiler->diagnostics_enabled &&
+      compiler->include_callback == _yr_compiler_default_include_callback)
+  {
+    canonical_id = _yr_compiler_canonicalize_path(file_name);
+  }
 
   for (i = 0; i < compiler->file_name_stack_ptr; i++)
   {
-    if (strcmp(file_name, compiler->file_name_stack[i]) == 0)
+    bool same_file;
+
+    if (canonical_id != NULL && compiler->file_name_stack[i].canonical_id != NULL)
+      same_file =
+          strcmp(canonical_id, compiler->file_name_stack[i].canonical_id) == 0;
+    else
+      same_file = strcmp(file_name, compiler->file_name_stack[i].file_name) == 0;
+
+    if (same_file)
+    {
+      _yr_compiler_add_diagnostic(
+          compiler,
+          YR_DIAGNOSTIC_INCLUDE_CYCLE,
+          file_name,
+          line,
+          "circular include detected: \"%s\" is already being included "
+          "higher up in the include chain",
+          file_name);
+
+      yr_free(canonical_id);
       return ERROR_INCLUDES_CIRCULAR_REFERENCE;
+    }
   }
 
   if (compiler->file_name_stack_ptr == YR_MAX_INCLUDE_DEPTH)
+  {
+    _yr_compiler_add_diagnostic(
+        compiler,
+        YR_DIAGNOSTIC_INCLUDE_DEPTH_EXCEEDED,
+        file_name,
+        line,
+        "include depth exceeded (maximum is %d); the diagnostic's chain "
+        "holds the longest include chain seen so far",
+        YR_MAX_INCLUDE_DEPTH);
+
+    yr_free(canonical_id);
     return ERROR_INCLUDE_DEPTH_EXCEEDED;
+  }
+
+  // A file that was fully included before through a different branch of the
+  // include graph is a diamond, not a cycle. This is only checked when the
+  // file's identity is known.
+  if (compiler->diagnostics_enabled && canonical_id != NULL)
+  {
+    const char* ns_name = _yr_compiler_current_namespace_name(compiler);
+
+    YR_INCLUDED_FILE* included = (YR_INCLUDED_FILE*) yr_hash_table_lookup(
+        compiler->included_files, canonical_id, ns_name);
+
+    if (included != NULL)
+    {
+      YR_DIAGNOSTIC* diag = _yr_compiler_add_diagnostic(
+          compiler,
+          YR_DIAGNOSTIC_INCLUDE_DUPLICATE,
+          file_name,
+          line,
+          "duplicate include: \"%s\" was already included from \"%s\" line %d",
+          file_name,
+          included->included_from != NULL ? included->included_from : "",
+          included->line);
+
+      if (diag != NULL && included->included_from != NULL)
+      {
+        diag->related_file = yr_strdup(included->included_from);
+        diag->related_line = included->line;
+      }
+
+      yr_compiler_set_error_extra_info(compiler, file_name);
+      yr_free(canonical_id);
+      return ERROR_DUPLICATED_INCLUDE;
+    }
+  }
 
   str = yr_strdup(file_name);
 
   if (str == NULL)
+  {
+    yr_free(canonical_id);
     return ERROR_INSUFFICIENT_MEMORY;
+  }
 
-  compiler->file_name_stack[compiler->file_name_stack_ptr] = str;
+  compiler->file_name_stack[compiler->file_name_stack_ptr].file_name = str;
+  compiler->file_name_stack[compiler->file_name_stack_ptr].canonical_id =
+      canonical_id;
+  compiler->file_name_stack[compiler->file_name_stack_ptr].line = line;
   compiler->file_name_stack_ptr++;
 
   return ERROR_SUCCESS;
@@ -501,8 +971,53 @@ void _yr_compiler_pop_file_name(YR_COMPILER* compiler)
   if (compiler->file_name_stack_ptr > 0)
   {
     compiler->file_name_stack_ptr--;
-    yr_free(compiler->file_name_stack[compiler->file_name_stack_ptr]);
-    compiler->file_name_stack[compiler->file_name_stack_ptr] = NULL;
+
+    YR_INCLUDE_FRAME* frame =
+        &compiler->file_name_stack[compiler->file_name_stack_ptr];
+
+    // Record the file as fully included so that a later include of the same
+    // file in the same namespace is reported as a duplicate include.
+    if (compiler->diagnostics_enabled && frame->canonical_id != NULL)
+    {
+      const char* ns_name = _yr_compiler_current_namespace_name(compiler);
+
+      if (yr_hash_table_lookup(
+              compiler->included_files, frame->canonical_id, ns_name) == NULL)
+      {
+        YR_INCLUDED_FILE* included =
+            (YR_INCLUDED_FILE*) yr_calloc(1, sizeof(YR_INCLUDED_FILE));
+
+        if (included != NULL)
+        {
+          included->file_name = yr_strdup(frame->file_name);
+          included->line = frame->line;
+
+          if (compiler->file_name_stack_ptr > 0)
+          {
+            included->included_from = yr_strdup(
+                compiler->file_name_stack[compiler->file_name_stack_ptr - 1]
+                    .file_name);
+          }
+
+          if (yr_hash_table_add(
+                  compiler->included_files,
+                  frame->canonical_id,
+                  ns_name,
+                  included) != ERROR_SUCCESS)
+          {
+            yr_free(included->file_name);
+            yr_free(included->included_from);
+            yr_free(included);
+          }
+        }
+      }
+    }
+
+    yr_free(frame->file_name);
+    yr_free(frame->canonical_id);
+    frame->file_name = NULL;
+    frame->canonical_id = NULL;
+    frame->line = 0;
   }
 }
 
@@ -523,12 +1038,31 @@ YR_API char* yr_compiler_get_current_file_name(YR_COMPILER* compiler)
 {
   if (compiler->file_name_stack_ptr > 0)
   {
-    return compiler->file_name_stack[compiler->file_name_stack_ptr - 1];
+    return compiler->file_name_stack[compiler->file_name_stack_ptr - 1]
+        .file_name;
   }
   else
   {
     return NULL;
   }
+}
+
+YR_API void yr_compiler_set_diagnostics_enabled(
+    YR_COMPILER* compiler,
+    bool enabled)
+{
+  compiler->diagnostics_enabled = enabled;
+}
+
+YR_API int yr_compiler_get_num_diagnostics(YR_COMPILER* compiler)
+{
+  return compiler->num_diagnostics;
+}
+
+YR_API const YR_DIAGNOSTIC* yr_compiler_get_diagnostics(
+    YR_COMPILER* compiler)
+{
+  return compiler->diagnostics;
 }
 
 static int _yr_compiler_set_namespace(
@@ -600,7 +1134,7 @@ YR_API int yr_compiler_add_file(
     compiler->last_error = _yr_compiler_set_namespace(compiler, "default");
 
   if (compiler->last_error == ERROR_SUCCESS && file_name != NULL)
-    compiler->last_error = _yr_compiler_push_file_name(compiler, file_name);
+    compiler->last_error = _yr_compiler_push_file_name(compiler, file_name, 0);
 
   if (compiler->last_error != ERROR_SUCCESS)
     return ++compiler->errors;
@@ -635,7 +1169,7 @@ YR_API int yr_compiler_add_fd(
     compiler->last_error = _yr_compiler_set_namespace(compiler, "default");
 
   if (compiler->last_error == ERROR_SUCCESS && file_name != NULL)
-    compiler->last_error = _yr_compiler_push_file_name(compiler, file_name);
+    compiler->last_error = _yr_compiler_push_file_name(compiler, file_name, 0);
 
   if (compiler->last_error != ERROR_SUCCESS)
     return ++compiler->errors;
@@ -998,6 +1532,13 @@ YR_API char* yr_compiler_get_error_message(
     break;
   case ERROR_INCLUDE_DEPTH_EXCEEDED:
     snprintf(buffer, buffer_size, "too many levels of included rules");
+    break;
+  case ERROR_DUPLICATED_INCLUDE:
+    snprintf(
+        buffer,
+        buffer_size,
+        "duplicated include \"%s\"",
+        compiler->last_error_extra_info);
     break;
   case ERROR_LOOP_NESTING_LIMIT_EXCEEDED:
     snprintf(buffer, buffer_size, "loop nesting limit exceeded");

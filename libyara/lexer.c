@@ -945,6 +945,8 @@ with noyywrap then we can remove this pragma.
 #include <stdlib.h>
 #include <string.h>
 #include <setjmp.h>
+#include <ctype.h>
+#include <errno.h>
 
 #if defined(_WIN32) || defined(__CYGWIN__)
 #include <windows.h>
@@ -1666,8 +1668,14 @@ YY_RULE_SETUP
     const char* included_rules;
     char* current_file_name;
     char* include_path;
+    int include_line;
 
     *yyextra->lex_buf_ptr = '\0'; // null-terminate included file path
+
+    // Line where the include statement appears in the including file. This
+    // is captured before switching buffers so that diagnostics can point to
+    // the exact include site.
+    include_line = yyget_lineno(yyscanner);
 
     current_file_name = yr_compiler_get_current_file_name(compiler);
 
@@ -1720,7 +1728,8 @@ YY_RULE_SETUP
 
     if (included_rules != NULL)
     {
-      int error_code = _yr_compiler_push_file_name(compiler, include_path);
+      int error_code = _yr_compiler_push_file_name(
+          compiler, include_path, include_line);
 
       if (error_code != ERROR_SUCCESS)
       {
@@ -1731,6 +1740,10 @@ YY_RULE_SETUP
         else if (error_code == ERROR_INCLUDE_DEPTH_EXCEEDED)
         {
           yyerror(yyscanner, compiler, "includes depth exceeded");
+        }
+        else if (error_code == ERROR_DUPLICATED_INCLUDE)
+        {
+          yyerror(yyscanner, compiler, "duplicated include");
         }
 
         if (compiler->include_free != NULL)
@@ -1763,6 +1776,38 @@ YY_RULE_SETUP
       else
       {
         err_msg_fmt = "callback failed to provide include resource: %s";
+      }
+
+      // Distinguish "the resource does not exist" from "the resource exists
+      // but could not be read or was rejected", preserving the original
+      // spelling of the include and the site it was requested from. For
+      // custom include callbacks the source is not necessarily a local file,
+      // so only the default (file system) callback probes the file.
+      if (compiler->diagnostics_enabled)
+      {
+        int diag_kind = YR_DIAGNOSTIC_INCLUDE_NOT_READABLE;
+
+        if (compiler->include_callback == _yr_compiler_default_include_callback)
+        {
+          struct stat st;
+
+          if (stat(include_path, &st) != 0 &&
+              (errno == ENOENT || errno == ENOTDIR))
+          {
+            diag_kind = YR_DIAGNOSTIC_INCLUDE_NOT_FOUND;
+          }
+        }
+
+        _yr_compiler_add_diagnostic(
+            compiler,
+            diag_kind,
+            yyextra->lex_buf,
+            include_line,
+            diag_kind == YR_DIAGNOSTIC_INCLUDE_NOT_FOUND
+                ? "include not found: \"%s\""
+                : "include \"%s\" exists but could not be read, or was "
+                  "rejected by the include source",
+            yyextra->lex_buf);
       }
 
       snprintf(
@@ -3417,6 +3462,238 @@ void yyfree (void * ptr , yyscan_t yyscanner)
 
 
 
+// Scans the remaining input of the current lexer buffer for a rule
+// definition of the given identifier. If found, returns 1 and sets *line to
+// the line where the "rule" keyword appears. This is a best-effort heuristic
+// used only for diagnostics: it skips whitespace, comments and string
+// literals, but it does not implement the full grammar (regular expression
+// literals in particular are not skipped), so a false positive only affects
+// the text of a diagnostic, never the outcome of the compilation.
+static int yr_lexer_scan_ahead_for_rule(
+    yyscan_t yyscanner,
+    const char* identifier,
+    int* line)
+{
+  struct yyguts_t* yyg = (struct yyguts_t*) yyscanner;
+  YY_BUFFER_STATE b = YY_CURRENT_BUFFER;
+
+  if (b == NULL || b->yy_ch_buf == NULL)
+    return 0;
+
+  char* p = b->yy_buf_pos;
+  char* end = b->yy_ch_buf + b->yy_n_chars;
+  int lineno = yyget_lineno(yyscanner);
+  size_t idlen = strlen(identifier);
+
+  while (p < end)
+  {
+    char c = *p;
+
+    if (c == '\n')
+    {
+      lineno++;
+      p++;
+      continue;
+    }
+
+    if (isspace((unsigned char) c))
+    {
+      p++;
+      continue;
+    }
+
+    // Single-line comment.
+    if (c == '/' && p + 1 < end && p[1] == '/')
+    {
+      while (p < end && *p != '\n')
+        p++;
+      continue;
+    }
+
+    // Multi-line comment.
+    if (c == '/' && p + 1 < end && p[1] == '*')
+    {
+      p += 2;
+      while (p + 1 < end && !(p[0] == '*' && p[1] == '/'))
+      {
+        if (*p == '\n')
+          lineno++;
+        p++;
+      }
+      p = (p + 1 < end) ? p + 2 : end;
+      continue;
+    }
+
+    // String literal.
+    if (c == '"')
+    {
+      p++;
+      while (p < end && *p != '"')
+      {
+        if (*p == '\\' && p + 1 < end)
+          p++;
+        if (*p == '\n')
+          lineno++;
+        p++;
+      }
+      if (p < end)
+        p++;
+      continue;
+    }
+
+    if (isalpha((unsigned char) c) || c == '_')
+    {
+      char* start = p;
+
+      while (p < end && (isalnum((unsigned char) *p) || *p == '_'))
+        p++;
+
+      if (p - start == 4 && strncmp(start, "rule", 4) == 0)
+      {
+        // Candidate "rule" keyword; skip whitespace and comments, then
+        // compare the next token with the identifier.
+        int rule_line = lineno;
+        char* q = p;
+
+        while (q < end)
+        {
+          if (*q == '\n')
+          {
+            lineno++;
+            q++;
+          }
+          else if (isspace((unsigned char) *q))
+          {
+            q++;
+          }
+          else if (q + 1 < end && q[0] == '/' && q[1] == '/')
+          {
+            while (q < end && *q != '\n')
+              q++;
+          }
+          else if (q + 1 < end && q[0] == '/' && q[1] == '*')
+          {
+            q += 2;
+            while (q + 1 < end && !(q[0] == '*' && q[1] == '/'))
+            {
+              if (*q == '\n')
+                lineno++;
+              q++;
+            }
+            q = (q + 1 < end) ? q + 2 : end;
+          }
+          else
+          {
+            break;
+          }
+        }
+
+        if (q < end && (isalpha((unsigned char) *q) || *q == '_'))
+        {
+          char* id_start = q;
+
+          while (q < end && (isalnum((unsigned char) *q) || *q == '_'))
+            q++;
+
+          if ((size_t)(q - id_start) == idlen &&
+              strncmp(id_start, identifier, idlen) == 0)
+          {
+            *line = rule_line;
+            return 1;
+          }
+        }
+      }
+      continue;
+    }
+
+    p++;
+  }
+
+  return 0;
+}
+
+
+// Produces a diagnostic for an undefined rule identifier, distinguishing
+// three cases: the rule is defined later in the same file (forward
+// reference), a rule with the same name exists in another namespace, or the
+// rule doesn't exist anywhere.
+static void yr_lexer_diagnose_undefined_identifier(
+    yyscan_t yyscanner,
+    YR_COMPILER* compiler)
+{
+  const char* identifier = compiler->last_error_extra_info;
+
+  YR_NAMESPACE* ns = (YR_NAMESPACE*) yr_arena_get_ptr(
+      compiler->arena, YR_NAMESPACES_TABLE, 0);
+
+  for (int i = 0; i < compiler->num_namespaces; i++, ns++)
+  {
+    if (i == (int) compiler->current_namespace_idx)
+      continue;
+
+    if (yr_hash_table_lookup_uint32(
+            compiler->rules_table, identifier, ns->name) != UINT32_MAX)
+    {
+      YR_DIAGNOSTIC* diag = _yr_compiler_add_diagnostic(
+          compiler,
+          YR_DIAGNOSTIC_UNDEFINED_RULE_OTHER_NAMESPACE,
+          NULL,
+          0,
+          "undefined rule \"%s\" (a rule with this name exists in namespace "
+          "\"%s\")",
+          identifier,
+          ns->name);
+
+      if (diag != NULL)
+      {
+        diag->identifier = yr_strdup(identifier);
+        diag->name_space = yr_strdup(ns->name);
+      }
+
+      return;
+    }
+  }
+
+  int def_line = 0;
+
+  if (yr_lexer_scan_ahead_for_rule(yyscanner, identifier, &def_line))
+  {
+    YR_DIAGNOSTIC* diag = _yr_compiler_add_diagnostic(
+        compiler,
+        YR_DIAGNOSTIC_UNDEFINED_RULE_FORWARD_REF,
+        NULL,
+        0,
+        "rule \"%s\" is used before it is defined (defined later in this "
+        "file at line %d)",
+        identifier,
+        def_line);
+
+    if (diag != NULL)
+    {
+      const char* current_file = yr_compiler_get_current_file_name(compiler);
+
+      diag->identifier = yr_strdup(identifier);
+      diag->related_file =
+          current_file != NULL ? yr_strdup(current_file) : NULL;
+      diag->related_line = def_line;
+    }
+
+    return;
+  }
+
+  YR_DIAGNOSTIC* diag = _yr_compiler_add_diagnostic(
+      compiler,
+      YR_DIAGNOSTIC_UNDEFINED_RULE,
+      NULL,
+      0,
+      "undefined rule \"%s\"",
+      identifier);
+
+  if (diag != NULL)
+    diag->identifier = yr_strdup(identifier);
+}
+
+
 void yywarning(
     yyscan_t yyscanner,
     const char *message_fmt,
@@ -3434,7 +3711,7 @@ void yywarning(
   va_start(message_args, message_fmt);
 
   if (compiler->file_name_stack_ptr > 0)
-    file_name = compiler->file_name_stack[compiler->file_name_stack_ptr - 1];
+    file_name = compiler->file_name_stack[compiler->file_name_stack_ptr - 1].file_name;
   else
     file_name = NULL;
 
@@ -3490,7 +3767,7 @@ void yyerror(
 
   if (compiler->file_name_stack_ptr > 0)
   {
-    file_name = compiler->file_name_stack[compiler->file_name_stack_ptr - 1];
+    file_name = compiler->file_name_stack[compiler->file_name_stack_ptr - 1].file_name;
   }
   else
   {
@@ -3536,6 +3813,16 @@ void yyerror(
         current_rule,
         message,
         compiler->user_data);
+  }
+
+  // Enrich undefined identifier errors with a diagnostic that distinguishes
+  // forward references, references to rules living in another namespace, and
+  // references to rules that don't exist anywhere.
+  if (error_message == NULL &&
+      compiler->last_error == ERROR_UNDEFINED_IDENTIFIER &&
+      compiler->diagnostics_enabled)
+  {
+    yr_lexer_diagnose_undefined_identifier(yyscanner, compiler);
   }
 }
 

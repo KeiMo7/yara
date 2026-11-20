@@ -158,6 +158,101 @@ typedef struct _YR_FIXUP
 
 } YR_FIXUP;
 
+// Diagnostic kinds produced by the compiler's diagnostics facility. The
+// facility is opt-in (see yr_compiler_set_diagnostics_enabled); when it is
+// disabled the compiler behaves exactly as if these diagnostics didn't exist.
+#define YR_DIAGNOSTIC_INCLUDE_CYCLE 1
+#define YR_DIAGNOSTIC_INCLUDE_DUPLICATE 2
+#define YR_DIAGNOSTIC_INCLUDE_DEPTH_EXCEEDED 3
+#define YR_DIAGNOSTIC_INCLUDE_NOT_FOUND 4
+#define YR_DIAGNOSTIC_INCLUDE_NOT_READABLE 5
+#define YR_DIAGNOSTIC_DUPLICATED_RULE 6
+#define YR_DIAGNOSTIC_UNDEFINED_RULE_FORWARD_REF 7
+#define YR_DIAGNOSTIC_UNDEFINED_RULE_OTHER_NAMESPACE 8
+#define YR_DIAGNOSTIC_UNDEFINED_RULE 9
+
+// One hop in an include chain. "file_name" preserves the original spelling
+// used at the point where the file was included (or passed to
+// yr_compiler_add_file for the root of the chain), while "canonical_id" is
+// the normalized identity used to decide whether two names refer to the same
+// file. "canonical_id" is NULL when the identity of the source is uncertain
+// (for example rules that come from memory, the network, or a custom include
+// callback). "line" is the line in the parent file where the include
+// statement appears, or 0 for the root of the chain.
+typedef struct _YR_INCLUDE_CHAIN_ENTRY
+{
+  char* file_name;
+  char* canonical_id;
+  int line;
+
+} YR_INCLUDE_CHAIN_ENTRY;
+
+// A single, machine-consumable diagnostic. "message" is a human-readable
+// summary. "chain" is the include chain that was active when the diagnostic
+// was produced, root first; for include-related diagnostics the last hop is
+// the include that triggered the diagnostic. The remaining fields are
+// kind-specific:
+//
+//   YR_DIAGNOSTIC_DUPLICATED_RULE:
+//     "identifier" is the duplicated rule identifier, "related_file" and
+//     "related_line" point to the first definition.
+//   YR_DIAGNOSTIC_UNDEFINED_RULE_FORWARD_REF:
+//     "identifier" is the referenced rule, "related_file" and "related_line"
+//     point to the later definition.
+//   YR_DIAGNOSTIC_UNDEFINED_RULE_OTHER_NAMESPACE:
+//     "identifier" is the referenced rule, "name_space" is the namespace
+//     where a rule with that name exists.
+//   YR_DIAGNOSTIC_UNDEFINED_RULE:
+//     "identifier" is the referenced rule.
+//   YR_DIAGNOSTIC_INCLUDE_DUPLICATE:
+//     "related_file" and "related_line" indicate where the same file was
+//     included from the first time.
+typedef struct _YR_DIAGNOSTIC
+{
+  int kind;
+  char* message;
+  YR_INCLUDE_CHAIN_ENTRY* chain;
+  int chain_length;
+  char* identifier;
+  char* related_file;
+  int related_line;
+  char* name_space;
+
+} YR_DIAGNOSTIC;
+
+// Frame in the compiler's include stack. Tracks both the original spelling
+// of the file name (for display) and its canonical identity (for cycle and
+// duplicate detection), plus the line in the parent file where the include
+// statement appears.
+typedef struct _YR_INCLUDE_FRAME
+{
+  char* file_name;
+  char* canonical_id;
+  int line;
+
+} YR_INCLUDE_FRAME;
+
+// Records a file that was fully processed through the include machinery, so
+// that including it again in the same namespace can be reported as a
+// duplicate include (a diamond) instead of a cascade of duplicated rule
+// definitions.
+typedef struct _YR_INCLUDED_FILE
+{
+  char* file_name;
+  char* included_from;
+  int line;
+
+} YR_INCLUDED_FILE;
+
+// Location of a rule definition, used to point to the first definition when
+// a duplicated identifier is found.
+typedef struct _YR_RULE_LOCATION
+{
+  char* file_name;
+  int line;
+
+} YR_RULE_LOCATION;
+
 // Each "for" loop in the condition has an associated context which holds
 // information about loop, like the target address for the jump instruction
 // that goes back to the beginning of the loop and the local variables used
@@ -290,8 +385,24 @@ typedef struct _YR_COMPILER
   int loop_index;
   int loop_for_of_var_index;
 
-  char* file_name_stack[YR_MAX_INCLUDE_DEPTH];
+  YR_INCLUDE_FRAME file_name_stack[YR_MAX_INCLUDE_DEPTH];
   int file_name_stack_ptr;
+
+  // Opt-in diagnostics facility. When diagnostics_enabled is false the
+  // compiler behaves exactly as it did before this facility existed.
+  bool diagnostics_enabled;
+  YR_DIAGNOSTIC* diagnostics;
+  int num_diagnostics;
+
+  // Files that have been fully processed through the include machinery,
+  // keyed by canonical identity and namespace. Used to detect diamond
+  // includes.
+  YR_HASH_TABLE* included_files;
+
+  // Location (file and line) where each rule was defined, keyed by rule
+  // identifier and namespace. Used to attribute duplicated identifiers to
+  // their first definition.
+  YR_HASH_TABLE* rule_locations;
 
   char last_error_extra_info[YR_MAX_COMPILER_ERROR_EXTRA_INFO];
 
@@ -329,9 +440,24 @@ typedef struct _YR_COMPILER
       fmt,                                                       \
       __VA_ARGS__);
 
-int _yr_compiler_push_file_name(YR_COMPILER* compiler, const char* file_name);
+int _yr_compiler_push_file_name(
+    YR_COMPILER* compiler,
+    const char* file_name,
+    int line);
 
 void _yr_compiler_pop_file_name(YR_COMPILER* compiler);
+
+// Creates a new diagnostic of the given kind, snapshots the current include
+// chain into it (appending one extra hop if extra_hop_file is not NULL) and
+// sets its human-readable message. Returns the new diagnostic, or NULL if
+// diagnostics are disabled or memory runs out. Never fails the compilation.
+YR_DIAGNOSTIC* _yr_compiler_add_diagnostic(
+    YR_COMPILER* compiler,
+    int kind,
+    const char* extra_hop_file,
+    int extra_hop_line,
+    const char* message_fmt,
+    ...);
 
 int _yr_compiler_get_var_frame(YR_COMPILER* compiler);
 
@@ -414,6 +540,15 @@ YR_API char* yr_compiler_get_error_message(
     int buffer_size);
 
 YR_API char* yr_compiler_get_current_file_name(YR_COMPILER* compiler);
+
+YR_API void yr_compiler_set_diagnostics_enabled(
+    YR_COMPILER* compiler,
+    bool enabled);
+
+YR_API int yr_compiler_get_num_diagnostics(YR_COMPILER* compiler);
+
+YR_API const YR_DIAGNOSTIC* yr_compiler_get_diagnostics(
+    YR_COMPILER* compiler);
 
 YR_API int yr_compiler_define_integer_variable(
     YR_COMPILER* compiler,

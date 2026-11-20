@@ -999,7 +999,41 @@ int yr_parser_reduce_rule_declaration_phase_1(
       yr_hash_table_lookup(compiler->objects_table, identifier, NULL) != NULL)
   {
     // A rule or variable with the same identifier already exists, return the
-    // appropriate error.
+    // appropriate error. Note: the parser's error recovery may reduce this
+    // action multiple times for the same offending rule, so the diagnostic
+    // must be idempotent (see _yr_compiler_add_diagnostic).
+
+    if (compiler->diagnostics_enabled)
+    {
+      YR_RULE_LOCATION* location = (YR_RULE_LOCATION*) yr_hash_table_lookup(
+          compiler->rule_locations, identifier, ns->name);
+
+      YR_DIAGNOSTIC* diag = _yr_compiler_add_diagnostic(
+          compiler,
+          YR_DIAGNOSTIC_DUPLICATED_RULE,
+          NULL,
+          0,
+          location != NULL && location->file_name != NULL
+              ? "rule \"%s\" is already defined (first defined in \"%s\" "
+                "line %d)"
+              : "rule \"%s\" is already defined",
+          identifier,
+          location != NULL ? location->file_name : "",
+          location != NULL ? location->line : 0);
+
+      if (diag != NULL)
+      {
+        diag->identifier = yr_strdup(identifier);
+
+        if (location != NULL)
+        {
+          diag->related_file = location->file_name != NULL
+              ? yr_strdup(location->file_name)
+              : NULL;
+          diag->related_line = location->line;
+        }
+      }
+    }
 
     yr_compiler_set_error_extra_info(compiler, identifier);
     return ERROR_DUPLICATED_IDENTIFIER;
@@ -1083,6 +1117,32 @@ int yr_parser_reduce_rule_declaration_phase_1(
 
   FAIL_ON_ERROR(yr_hash_table_add_uint32(
       compiler->rules_table, identifier, ns->name, compiler->current_rule_idx));
+
+  // Record where this rule was defined so that a later duplicated identifier
+  // can be attributed to its first definition. Bookkeeping failures are not
+  // fatal to the compilation.
+  if (compiler->diagnostics_enabled)
+  {
+    YR_RULE_LOCATION* location =
+        (YR_RULE_LOCATION*) yr_calloc(1, sizeof(YR_RULE_LOCATION));
+
+    if (location != NULL)
+    {
+      const char* current_file = yr_compiler_get_current_file_name(compiler);
+
+      location->file_name =
+          current_file != NULL ? yr_strdup(current_file) : NULL;
+      location->line = yyget_lineno(yyscanner);
+
+      if (yr_hash_table_add(
+              compiler->rule_locations, identifier, ns->name, location) !=
+          ERROR_SUCCESS)
+      {
+        yr_free(location->file_name);
+        yr_free(location);
+      }
+    }
+  }
 
   return ERROR_SUCCESS;
 }
